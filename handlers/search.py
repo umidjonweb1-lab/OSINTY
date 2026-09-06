@@ -1,7 +1,9 @@
-from aiogram import Router
+from html import escape
+from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message
-from database.db import upsert_user, add_search, add_tracking
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from database.db import upsert_user, add_search, add_tracking, search_local_users, get_local_user
+from keyboards.main import back_menu
 
 router = Router()
 
@@ -9,29 +11,86 @@ def arg(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     return parts[1].strip() if len(parts) == 2 else ""
 
+def display(row):
+    name = " ".join(x for x in [row["first_name"], row["last_name"]] if x) or "—"
+    username = f'@{row["username"]}' if row["username"] else "—"
+    return f"👤 <b>{escape(name)}</b> — {escape(username)}\n<code>{row["telegram_id"]}</code>"
+
+def result_keyboard(telegram_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Profile", callback_data=f"quickprofile:{telegram_id}")],
+        [InlineKeyboardButton(text="💠 Names", callback_data=f"names:{telegram_id}")],
+        [InlineKeyboardButton(text="🔎 New search", callback_data="search")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="menu")],
+    ])
+
+async def run_user_search(message: Message, q: str):
+    if len(q) > 128:
+        return await message.answer("❌ Qidiruv so‘rovi 128 belgidan oshmasin.")
+    add_search(message.from_user.id, q, "user")
+
+    # A public username can be resolved directly through Telegram Bot API.
+    if q.startswith("@") or (q and q.replace("_", "").isalnum() and not q.isdigit() and " " not in q):
+        username = q if q.startswith("@") else "@" + q
+        try:
+            chat = await message.bot.get_chat(username)
+            name = chat.title or " ".join(x for x in [chat.first_name, chat.last_name] if x) or "—"
+            uname = f"@{chat.username}" if chat.username else "—"
+            text = [
+                "🔎 <b>SEARCH RESULT</b>", "",
+                f"👤 Name: <b>{escape(name)}</b>",
+                f"🔗 Username: <b>{escape(uname)}</b>",
+                f"🆔 ID: <code>{chat.id}</code>",
+                f"📌 Type: <b>{escape(chat.type)}</b>",
+            ]
+            if chat.type in {"group", "supergroup", "channel"}:
+                try:
+                    count = await message.bot.get_chat_member_count(chat.id)
+                    text.append(f"👥 Members: <b>{count}</b>")
+                except Exception:
+                    pass
+            if chat.username:
+                text.append(f'🌐 <a href="https://t.me/{escape(chat.username)}">Open Telegram</a>')
+            return await message.answer("\n".join(text), parse_mode="HTML", disable_web_page_preview=True, reply_markup=result_keyboard(chat.id) if chat.type == "private" else back_menu())
+        except Exception:
+            pass
+
+    # Numeric IDs and names are searched in the bot's collected public interaction index.
+    rows = search_local_users(q, 10)
+    if not rows and q.isdigit():
+        row = get_local_user(int(q))
+        if row:
+            rows = [row]
+    if not rows:
+        return await message.answer(
+            "🔎 <b>Natija topilmadi</b>\n\n"
+            "Boshqa username, ID yoki ism bilan urinib ko‘ring.",
+            parse_mode="HTML", reply_markup=back_menu())
+    text = [f"🔎 <b>SEARCH: {escape(q)}</b>", "", f"Topildi: <b>{len(rows)}</b>", ""]
+    for i, row in enumerate(rows, 1):
+        text.append(f"<b>{i}.</b> {display(row)}")
+    text.append("\nProfilni ochish: <code>/profile ID</code>")
+    await message.answer("\n".join(text), parse_mode="HTML", reply_markup=back_menu())
+
 @router.message(Command("search"))
 async def search(message: Message):
     upsert_user(message.from_user)
     q = arg(message)
     if not q:
-        return await message.answer("🔎 Misol: <code>/search football</code>", parse_mode="HTML")
-    add_search(message.from_user.id, q, "search")
-    await message.answer(
-        f"🔎 <b>Search</b>\n\nQuery: <code>{q}</code>\n\n"
-        "Natija providerga bog‘liq. Telegram Bot API global qidiruv bazasini bermaydi.",
-        parse_mode="HTML")
+        return await message.answer(
+            "🔎 <b>Advanced Search</b>\n\n"
+            "<code>/search @username</code>\n"
+            "<code>/search 123456789</code>\n"
+            "<code>/search Ali Valiyev</code>", parse_mode="HTML")
+    await run_user_search(message, q)
 
 @router.message(Command("human"))
 async def human(message: Message):
     upsert_user(message.from_user)
     q = arg(message)
     if not q:
-        return await message.answer("👨 Misol: <code>/human John Smith</code>", parse_mode="HTML")
-    add_search(message.from_user.id, q, "human")
-    await message.answer(
-        f"👨 <b>Human Search</b>\n\nQuery: <code>{q}</code>\n\n"
-        "Faqat qonuniy/public data source ulanganida real natijalar chiqadi.",
-        parse_mode="HTML")
+        return await message.answer("👨 Misol: <code>/human Ali Valiyev</code>", parse_mode="HTML")
+    await run_user_search(message, q)
 
 @router.message(Command("text"))
 async def text_search(message: Message):
@@ -40,10 +99,10 @@ async def text_search(message: Message):
     if not q:
         return await message.answer("📝 Misol: <code>/text football</code>", parse_mode="HTML")
     add_search(message.from_user.id, q, "text")
-    await message.answer(
-        f"📝 <b>Text Search</b>\n\nQuery: <code>{q}</code>\n\n"
-        "Natijalar faqat public indeks manbasi orqali beriladi.",
-        parse_mode="HTML")
+    return await message.answer(
+        f"📝 <b>Text Search</b>\n\nQuery: <code>{escape(q)}</code>\n\n"
+        "Public matn indeksiga mos yozuvlar keyingi indekslashdan chiqadi.",
+        parse_mode="HTML", reply_markup=back_menu())
 
 @router.message(Command("track"))
 async def track(message: Message):
@@ -55,13 +114,36 @@ async def track(message: Message):
         return await message.answer("❌ Target juda uzun.")
     add_tracking(message.from_user.id, q)
     await message.answer(
-        f"🔔 <b>Tracking added</b>\n\nTarget: <code>{q}</code>\n"
-        "O‘zgarishlarni tekshirish uchun public source adapter kerak bo‘ladi.",
+        f"🔔 <b>Tracking added</b>\n\nTarget: <code>{escape(q)}</code>",
         parse_mode="HTML")
 
-@router.message(Command("topchat"))
-async def topchat(message: Message):
-    await message.answer(
+@router.callback_query(F.data == "search")
+async def search_button(call: CallbackQuery):
+    await call.message.edit_text(
+        "🔎 <b>Advanced Search</b>\n\n"
+        "<code>/search @username</code> — public profil/chat\n"
+        "<code>/search 123456789</code> — ID\n"
+        "<code>/search Ali Valiyev</code> — ism/familiya",
+        parse_mode="HTML", reply_markup=back_menu())
+    await call.answer()
+
+@router.callback_query(F.data.startswith("quickprofile:"))
+async def quick_profile(call: CallbackQuery):
+    from handlers.profile import render_local_profile
+    try:
+        uid = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return await call.answer("ID xato", show_alert=True)
+    row = get_local_user(uid)
+    if not row:
+        return await call.answer("Profil topilmadi", show_alert=True)
+    await call.message.edit_text(render_local_profile(row), parse_mode="HTML", reply_markup=result_keyboard(uid))
+    await call.answer()
+
+@router.callback_query(F.data == "topchat")
+async def topchat(call: CallbackQuery):
+    await call.message.edit_text(
         "🏆 <b>Top Public Chats</b>\n\n"
-        "Bu bo‘lim public indeksdan reyting oladi. Hozircha indeks bo‘sh.",
-        parse_mode="HTML")
+        "Public chatlar botga ko‘ringan va indekslangan ma’lumotlardan shakllanadi.",
+        parse_mode="HTML", reply_markup=back_menu())
+    await call.answer()
